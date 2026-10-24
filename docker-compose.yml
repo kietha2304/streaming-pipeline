@@ -1,0 +1,256 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+      POSTGRES_DB: shop
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shop -d shop"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  controller:
+    image: apache/kafka:3.8.0
+    container_name: controller
+    environment:
+      CLUSTER_ID: SLHuy4sDQQmSHjJ80uLeeA
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: controller
+      KAFKA_LISTENERS: CONTROLLER://:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@controller:9093
+
+  kafka-1:
+    image: apache/kafka:3.8.0
+    container_name: kafka-1
+    depends_on:
+      - controller
+    ports:
+      - "29092:29092"
+    environment: &broker-env
+      CLUSTER_ID: SLHuy4sDQQmSHjJ80uLeeA
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: broker
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@controller:9093
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-2:
+    image: apache/kafka:3.8.0
+    container_name: kafka-2
+    depends_on:
+      - controller
+    ports:
+      - "29093:29093"
+    environment:
+      <<: *broker-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:9092,EXTERNAL://localhost:29093
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.0.0
+    container_name: kafka-ui
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: shop
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:9092,kafka-2:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+
+  # S3-compatible object store (MinIO replacement; MinIO's images are no longer published)
+  rustfs:
+    image: rustfs/rustfs:1.0.1
+    container_name: rustfs
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_CONSOLE_ENABLE: "true"
+    volumes:
+      - s3-data:/data
+
+  # One-shot: wait for the object store, then create the bucket
+  s3-init:
+    image: amazon/aws-cli:2.31.0
+    container_name: s3-init
+    depends_on:
+      - rustfs
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until aws --endpoint-url http://rustfs:9000 s3 ls >/dev/null 2>&1; do
+          echo "waiting for rustfs..."; sleep 2
+        done
+        aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket raw 2>/dev/null \
+          || aws --endpoint-url http://rustfs:9000 s3 mb s3://raw
+        echo "bucket raw ready"
+
+  # Kafka Connect: Debezium Postgres source + S3 sink
+  connect:
+    build: ./connect
+    container_name: connect
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      s3-init:
+        condition: service_completed_successfully
+    ports:
+      - "8083:8083"   # Connect REST API
+    environment:
+      BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092
+      GROUP_ID: connect-cluster
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 2
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 2
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 2
+
+  gen-online:
+    build: ./generator
+    container_name: gen-online
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CHANNEL: online
+      MIN_DELAY: "0.2"
+      MAX_DELAY: "0.8"
+      CANCEL_PROB: "0.1"
+      PG_DSN: postgresql://shop:shop@postgres:5432/shop
+
+  gen-pos:
+    build: ./generator
+    container_name: gen-pos
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CHANNEL: offline
+      MIN_DELAY: "0.5"
+      MAX_DELAY: "1.5"
+      CANCEL_PROB: "0"
+      PG_DSN: postgresql://shop:shop@postgres:5432/shop
+
+  # Flink: 1 JobManager (UI on :8081) + 1 TaskManager with 4 slots
+  jobmanager:
+    build: ./flink
+    container_name: jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"   # Flink Web UI
+    volumes:
+      - ./flink/sql:/opt/sql
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        jobmanager.memory.process.size: 1024m
+        parallelism.default: 2
+        execution.checkpointing.interval: 10s
+
+  taskmanager:
+    build: ./flink
+    container_name: taskmanager
+    command: taskmanager
+    depends_on:
+      - jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 1536m
+        parallelism.default: 2
+
+  # Event-driven refill trigger: inventory.alerts -> restocks. No container_name, so it can be
+  # scaled (Lab 4: docker compose up -d --scale replenishment=2)
+  replenishment:
+    build: ./replenishment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka-1:9092,kafka-2:9092
+      PG_DSN: postgresql://shop:shop@postgres:5432/shop
+      COMMIT_DELAY: "0"   # Lab 1: e.g. "10" to kill it between the DB write and the commit
+
+  # Simulated supplier: delivers requested restocks after DELIVERY_DELAY seconds
+  supplier:
+    build: ./supplier
+    container_name: supplier
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_DSN: postgresql://shop:shop@postgres:5432/shop
+      DELIVERY_DELAY: "20"   # Lab 3: "120"
+      CHECK_INTERVAL: "5"
+
+  # Live dashboard on http://localhost:8000
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP: kafka-1:9092,kafka-2:9092
+
+volumes:
+  pg-data:
+  s3-data:
