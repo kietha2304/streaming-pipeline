@@ -4,6 +4,14 @@
 SET 'pipeline.name' = 'inventory';
 SET 'table.local-time-zone' = 'UTC';
 
+-- Mini-batch: the aggregates fold a buffer of changes and emit only the final result per key.
+-- Without it, a restock going requested -> received (-U then +U) emits an intermediate row with
+-- on_order = 0 and received = 0. That row's position is below the reorder point, so it goes out
+-- as a real alert, and replenishment orders a second refill the moment the first one arrives.
+SET 'table.exec.mini-batch.enabled' = 'true';
+SET 'table.exec.mini-batch.allow-latency' = '1s';
+SET 'table.exec.mini-batch.size' = '1000';
+
 -- ---------------------------------------------------------------------------
 -- SOURCES: one CDC topic per table, all in consumer group flink-inventory.
 -- ---------------------------------------------------------------------------
@@ -51,23 +59,10 @@ CREATE TABLE restocks (
 -- ---------------------------------------------------------------------------
 -- CALCULATION: aggregate each side per product first, then join.
 -- Joining raw orders x raw restocks would multiply rows and inflate the sums.
+-- One view with subqueries, not a view per aggregate: views built on other views fail inside
+-- EXECUTE STATEMENT SET in the SQL client ("belongs to a different planner").
+-- LEFT JOINs keep products with no orders/restocks yet; COALESCE turns their NULLs into 0.
 -- ---------------------------------------------------------------------------
-CREATE TEMPORARY VIEW sold_per_product AS
-SELECT product_id, CAST(SUM(quantity) AS BIGINT) AS sold
-FROM orders
-WHERE status <> 'cancelled'
-GROUP BY product_id;
-
--- Same conditional-SUM trick as cancelled_count in sales.sql
-CREATE TEMPORARY VIEW restocks_per_product AS
-SELECT
-    product_id,
-    CAST(SUM(CASE WHEN status = 'received' THEN quantity ELSE 0 END) AS BIGINT) AS received,
-    CAST(SUM(CASE WHEN status = 'requested' THEN quantity ELSE 0 END) AS BIGINT) AS on_order
-FROM restocks
-GROUP BY product_id;
-
--- LEFT JOINs keep products with no orders/restocks yet; COALESCE turns their NULLs into 0
 CREATE TEMPORARY VIEW inventory AS
 SELECT
     p.product_id,
@@ -78,8 +73,21 @@ SELECT
     p.reorder_point,
     p.reorder_qty
 FROM products p
-LEFT JOIN sold_per_product s ON s.product_id = p.product_id
-LEFT JOIN restocks_per_product r ON r.product_id = p.product_id;
+LEFT JOIN (
+    SELECT product_id, CAST(SUM(quantity) AS BIGINT) AS sold
+    FROM orders
+    WHERE status <> 'cancelled'
+    GROUP BY product_id
+) s ON s.product_id = p.product_id
+LEFT JOIN (
+    -- Same conditional-SUM trick as cancelled_count in sales.sql
+    SELECT
+        product_id,
+        CAST(SUM(CASE WHEN status = 'received' THEN quantity ELSE 0 END) AS BIGINT) AS received,
+        CAST(SUM(CASE WHEN status = 'requested' THEN quantity ELSE 0 END) AS BIGINT) AS on_order
+    FROM restocks
+    GROUP BY product_id
+) r ON r.product_id = p.product_id;
 
 -- ---------------------------------------------------------------------------
 -- SINKS: 'upsert-kafka', one key per product.

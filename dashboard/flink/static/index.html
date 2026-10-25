@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shop Flink Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #6b7280; --border: #e3e6eb;
+          --online: #2f6fdf; --offline: #e07b20; --ok: #1f8a4c; --warn: #c08a00; --bad: #c62828; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  .muted { color: var(--muted); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 16px 0; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .tile .label { color: var(--muted); font-size: 12px; }
+  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .online { border-top: 3px solid var(--online); }
+  .offline { border-top: 3px solid var(--offline); }
+  .chart { height: 280px; margin-bottom: 16px; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child, th:last-child, td:last-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  .status { font-weight: 600; }
+  .s-ok { color: var(--ok); } .s-ordered { color: var(--warn); } .s-low, .s-negative { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Shop live dashboard (Flink)</h1>
+  <div class="muted" id="updated">Waiting for data…</div>
+
+  <section class="tiles">
+    <div class="card tile online"><div class="label">Online orders</div><div class="value" id="online-orders">–</div></div>
+    <div class="card tile online"><div class="label">Online revenue</div><div class="value" id="online-revenue">–</div></div>
+    <div class="card tile offline"><div class="label">Offline orders</div><div class="value" id="offline-orders">–</div></div>
+    <div class="card tile offline"><div class="label">Offline revenue</div><div class="value" id="offline-revenue">–</div></div>
+    <div class="card tile"><div class="label">Online share of orders</div><div class="value" id="online-share">–</div></div>
+  </section>
+
+  <section class="card">
+    <h2>Orders per 10 s, last 15 min</h2>
+    <div class="chart"><canvas id="sales-chart"></canvas></div>
+  </section>
+
+  <section class="card" style="margin-top: 16px">
+    <h2>Inventory</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Product</th><th>Stock</th><th>Reorder point</th><th>On order</th><th>Position</th><th>Status</th></tr></thead>
+        <tbody id="inventory"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+const COLORS = { online: "#2f6fdf", offline: "#e07b20" };
+const num = new Intl.NumberFormat();
+const money = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const $ = id => document.getElementById(id);
+
+const chart = new Chart($("sales-chart"), {
+  type: "line",
+  data: { labels: [], datasets: [] },
+  options: { animation: false, maintainAspectRatio: false, interaction: { mode: "index", intersect: false },
+             scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } },
+});
+
+function renderSales({ totals, buckets }) {
+  const by = Object.fromEntries(totals.map(t => [t.channel, t]));
+  for (const ch of ["online", "offline"]) {
+    $(`${ch}-orders`).textContent = by[ch] ? num.format(by[ch].order_count) : "–";
+    $(`${ch}-revenue`).textContent = by[ch] ? money.format(by[ch].sales_amount) : "–";
+  }
+  const all = (by.online?.order_count ?? 0) + (by.offline?.order_count ?? 0);
+  $("online-share").textContent = all ? `${(100 * (by.online?.order_count ?? 0) / all).toFixed(1)} %` : "–";
+
+  // One x label per bucket seen on any channel; missing buckets count as 0 orders
+  const starts = [...new Set(Object.values(buckets).flat().map(b => b.bucket_start))].sort((a, b) => a - b);
+  chart.data.labels = starts.map(s => new Date(s).toLocaleTimeString());
+  chart.data.datasets = ["online", "offline"].map(ch => {
+    const counts = Object.fromEntries((buckets[ch] ?? []).map(b => [b.bucket_start, b.order_count]));
+    return { label: ch, data: starts.map(s => counts[s] ?? 0), borderColor: COLORS[ch],
+             backgroundColor: COLORS[ch], pointRadius: 0, borderWidth: 2, tension: 0.2 };
+  });
+  chart.update();
+}
+
+function status(p) {
+  if (p.stock < 0) return ["negative", "s-negative"];
+  if (p.on_order > 0) return ["refill ordered", "s-ordered"];
+  if (p.stock <= p.reorder_point) return ["below reorder point", "s-low"];
+  return ["OK", "s-ok"];
+}
+
+function renderInventory(rows) {
+  $("inventory").replaceChildren(...rows.map(p => {
+    const tr = document.createElement("tr");
+    const [text, cls] = status(p);
+    for (const v of [p.name, num.format(p.stock), num.format(p.reorder_point), num.format(p.on_order), num.format(p.position)]) {
+      tr.insertCell().textContent = v;
+    }
+    const cell = tr.insertCell();
+    cell.textContent = text;
+    cell.className = `status ${cls}`;
+    return tr;
+  }));
+}
+
+async function refresh() {
+  try {
+    const [sales, inventory] = await Promise.all([
+      fetch("/api/sales").then(r => r.json()),
+      fetch("/api/inventory").then(r => r.json()),
+    ]);
+    renderSales(sales);
+    renderInventory(inventory);
+    $("updated").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    $("updated").textContent = `Backend unreachable (${e.message})`;
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -18,13 +18,17 @@ create_topic() {
 }
 
 # CDC topics, written by Debezium
-create_topic pg.public.orders   2 delete    # one partition per channel
-create_topic pg.public.products 1 compact   # latest row per product is all that matters
-create_topic pg.public.restocks 1 delete    # low volume
+create_topic pg.public.orders 2 delete # one partition per channel
+create_topic pg.public.products 1 compact # latest row per product is all that matters
+create_topic pg.public.restocks 1 delete # low volume
 
 # Upsert topics, written by the Flink sales job
-create_topic metrics.sales_by_channel_10s    2 compact
+create_topic metrics.sales_by_channel_10s 2 compact
 create_topic metrics.sales_by_channel_totals 1 compact
+
+# Upsert topics, written by the Flink inventory job
+create_topic inventory.levels 2 compact # one key per product
+create_topic inventory.alerts 1 compact # a tombstone means "alert resolved"
 
 docker compose exec -T kafka-1 /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server "$BOOTSTRAP" --describe --exclude-internal

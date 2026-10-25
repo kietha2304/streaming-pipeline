@@ -100,8 +100,8 @@ services:
     image: rustfs/rustfs:1.0.1
     container_name: rustfs
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # web console
+      - "9000:9000" # S3 API
+      - "9001:9001" # web console
     environment:
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin
@@ -109,7 +109,7 @@ services:
     volumes:
       - s3-data:/data
 
-  # One-shot: wait for the object store, then create the bucket
+  # One-shot: wait for the object store, then create the buckets (raw = landing zone, lake = Spark)
   s3-init:
     image: amazon/aws-cli:2.31.0
     container_name: s3-init
@@ -125,9 +125,11 @@ services:
         until aws --endpoint-url http://rustfs:9000 s3 ls >/dev/null 2>&1; do
           echo "waiting for rustfs..."; sleep 2
         done
-        aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket raw 2>/dev/null \
-          || aws --endpoint-url http://rustfs:9000 s3 mb s3://raw
-        echo "bucket raw ready"
+        for bucket in raw lake; do
+          aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket $$bucket 2>/dev/null \
+            || aws --endpoint-url http://rustfs:9000 s3 mb s3://$$bucket
+          echo "bucket $$bucket ready"
+        done
 
   # Kafka Connect: Debezium Postgres source + S3 sink
   connect:
@@ -143,7 +145,7 @@ services:
       s3-init:
         condition: service_completed_successfully
     ports:
-      - "8083:8083"   # Connect REST API
+      - "8083:8083" # Connect REST API
     environment:
       BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092
       GROUP_ID: connect-cluster
@@ -186,7 +188,7 @@ services:
     container_name: jobmanager
     command: jobmanager
     ports:
-      - "8081:8081"   # Flink Web UI
+      - "8081:8081" # Flink Web UI
     volumes:
       - ./flink/sql:/opt/sql
     environment:
@@ -223,7 +225,7 @@ services:
     environment:
       KAFKA_BOOTSTRAP: kafka-1:9092,kafka-2:9092
       PG_DSN: postgresql://shop:shop@postgres:5432/shop
-      COMMIT_DELAY: "0"   # Lab 1: e.g. "10" to kill it between the DB write and the commit
+      COMMIT_DELAY: "0" # Lab 1: e.g. "10" to kill it between the DB write and the commit
 
   # Simulated supplier: delivers requested restocks after DELIVERY_DELAY seconds
   supplier:
@@ -234,23 +236,129 @@ services:
         condition: service_healthy
     environment:
       PG_DSN: postgresql://shop:shop@postgres:5432/shop
-      DELIVERY_DELAY: "20"   # Lab 3: "120"
+      DELIVERY_DELAY: "20" # Lab 3: "120"
       CHECK_INTERVAL: "5"
 
-  # Live dashboard on http://localhost:8000
-  dashboard:
-    build: ./dashboard
-    container_name: dashboard
+  # Phase 6 lab consumer: docker compose --profile lab up -d --scale order-tap=2 order-tap
+  order-tap:
+    build: ./order-tap
+    profiles: ["lab"]
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka-1:9092,kafka-2:9092
+      GROUP: order-tap
+
+  # --- Part 2: lake path (docker compose --profile lake up -d) ---------------------------------
+  # Jobs are submitted with ./scripts/submit-spark-jobs.sh
+  spark-master:
+    build: ./spark
+    image: streaming-pipeline-spark
+    container_name: spark-master
+    profiles: ["lake"]
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    depends_on:
+      s3-init:
+        condition: service_completed_successfully
+    ports:
+      - "8082:8080" # master UI (8080 is Kafka UI)
+      - "4040-4042:4040-4042" # one UI per running application
+    volumes:
+      - ./spark:/opt/jobs:ro
+
+  spark-worker:
+    image: streaming-pipeline-spark
+    container_name: spark-worker
+    profiles: ["lake"]
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_WORKER_CORES: "3" # one per job: bronze, silver, gold
+      SPARK_WORKER_MEMORY: 3g
+    volumes:
+      - ./spark:/opt/jobs:ro
+
+  # Lake dashboard on http://localhost:8002. Reads Spark's Delta tables from S3 with delta-rs,
+  # so it needs the object store but not a running Spark cluster.
+  dashboard-spark:
+    build: ./dashboard/spark
+    container_name: dashboard-spark
+    profiles: ["lake"]
+    depends_on:
+      s3-init:
+        condition: service_completed_successfully
+    ports:
+      - "8002:8000"
+    environment:
+      S3_ENDPOINT: http://rustfs:9000
+      S3_ACCESS_KEY: rustfsadmin
+      S3_SECRET_KEY: rustfsadmin
+
+  # --- Part 3: OLAP path (docker compose --profile olap up -d) ---------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: clickhouse
+    profiles: ["olap"]
     depends_on:
       kafka-1:
         condition: service_healthy
       kafka-2:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "8123:8123" # HTTP interface
+      - "9002:9000" # native protocol (9000 is the object store)
+    environment:
+      CLICKHOUSE_USER: shop
+      CLICKHOUSE_PASSWORD: shop
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q Ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Phase 11 dashboard on http://localhost:8001. Reads Flink's upsert topics straight from Kafka
+  # into memory, so it only needs Kafka and the Flink jobs.
+  dashboard-flink:
+    build: ./dashboard/flink
+    container_name: dashboard-flink
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
     environment:
       KAFKA_BOOTSTRAP: kafka-1:9092,kafka-2:9092
+
+  # Phase 20 dashboard on http://localhost:8000. Reads only ClickHouse.
+  dashboard-clickhouse:
+    build: ./dashboard/clickhouse
+    container_name: dashboard-clickhouse
+    profiles: ["olap"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: shop
+      CLICKHOUSE_PASSWORD: shop
 
 volumes:
   pg-data:
   s3-data:
+  clickhouse-data:

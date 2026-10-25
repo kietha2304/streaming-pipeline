@@ -99,18 +99,19 @@ Three paths, one source of events:
 | Kafka Connect + Debezium | `quay.io/debezium/connect:2.7.3.Final` |
 | Kafka UI | `ghcr.io/kafbat/kafka-ui:v1.0.0` |
 | Flink | `flink:1.20.1-scala_2.12-java17` + `flink-sql-connector-kafka-3.3.0-1.20.jar` |
-| Python services | `python:3.12-slim`, `psycopg[binary]`, `confluent-kafka`, `fastapi`, `uvicorn` |
-| MinIO | `minio/minio` and `minio/mc`, pinned to a `RELEASE.*` tag (never `latest`) |
+| Python services | `python:3.12-slim`, `psycopg[binary]`, `confluent-kafka`, `fastapi`, `uvicorn`, `clickhouse-connect` (Phase 20), `deltalake` + `pandas` (lake dashboard) |
+| S3-compatible object store | `rustfs/rustfs:1.0.1`, with `amazon/aws-cli:2.31.0` to create the buckets. MinIO's images are no longer published; wherever this guide says MinIO, the repo uses the `rustfs` and `s3-init` services |
 | S3 sink connector | Confluent `kafka-connect-s3` 10.5.x from Confluent Hub, added to the Connect image |
 | Spark | `apache/spark:3.5.3` (Scala 2.12, Hadoop 3.3.4) |
 | Spark packages | `org.apache.hadoop:hadoop-aws:3.3.4`, `io.delta:delta-spark_2.12:3.2.1` |
 | ClickHouse | `clickhouse/clickhouse-server:24.8` (an LTS release) |
 
 **Prerequisites:** Docker Desktop with **at least 8 GB RAM** for Part 1 and **10–12 GB** once
-Spark and MinIO join (~15 containers), `curl`, and an editor. You don't need every part running
-at once: when memory is tight, stop the parts you're not working on. Use compose **profiles**
-(`profiles: ["lake"]`, `profiles: ["olap"]`) so `docker compose --profile olap up -d` starts only
-what you need.
+Spark and the object store join (~15 containers), `curl`, and an editor. You don't need every
+part running at once: when memory is tight, stop the parts you're not working on. Use compose
+**profiles** (`profiles: ["lake"]`, `profiles: ["olap"]`, `profiles: ["lab"]`) so
+`docker compose --profile olap up -d` starts only what you need. With 8 GB, run Part 1 plus
+**one** of Part 2 or Part 3 at a time.
 
 **Target folder layout**
 
@@ -121,15 +122,18 @@ generator/            Dockerfile, generator.py         (one image, run twice: on
 connect/              Dockerfile                        (Debezium image + S3 sink plugin, Part 2)
 debezium/             shop-connector.json
 s3-sink/              s3-sink-connector.json            (Part 2)
-spark/                bronze.py, silver.py, gold.py     (Part 2)
+spark/                Dockerfile, spark-defaults.conf, common.py, bronze.py, silver.py, gold.py   (Part 2)
 clickhouse/           init/01_raw.sql, 02_current.sql, 03_sales.sql, 04_serving.sql   (Part 3)
+                      queries/five_questions.sql        (Phase 20)
 flink/                Dockerfile, sql/sales.sql, sql/inventory.sql
 replenishment/        Dockerfile, replenishment.py
 supplier/             Dockerfile, supplier.py
-dashboard/            Dockerfile, app.py, static/index.html
+dashboard/flink/      Dockerfile, app.py, static/index.html   (Phase 11: Flink topics in memory, :8001)
+dashboard/clickhouse/ Dockerfile, app.py, static/index.html   (Phase 20: ClickHouse, :8000)
+dashboard/spark/      Dockerfile, app.py, static/index.html   (lake: Delta tables via delta-rs, :8002)
 order-tap/            Dockerfile, tap.py                (small consumer for the consumer-group lab)
-scripts/              create-topics.sh, register-connector.sh, submit-flink-jobs.sh
-README.md, NOTES.md
+scripts/              create-topics.sh, register-connector.sh, submit-flink-jobs.sh, submit-spark-jobs.sh
+README.md, PRODUCTION.md, NOTES.md
 ```
 
 ---
@@ -270,9 +274,9 @@ point of failure too, but it's honest about it. Production uses 3 controllers.
 
 ```bash
 docker compose exec kafka-1 /opt/kafka/bin/kafka-metadata-quorum.sh \
-  --bootstrap-server kafka-1:9092 describe --status          # leader = 1, 2 observers (the brokers)
+  --bootstrap-server kafka-1:9092 describe --status # leader = 1, 2 observers (the brokers)
 docker compose exec kafka-1 /opt/kafka/bin/kafka-broker-api-versions.sh \
-  --bootstrap-server kafka-1:9092 | grep -c 'id:'            # 2
+  --bootstrap-server kafka-1:9092 | grep -c 'id:' # 2
 ```
 
 **🧪 Lab: replication and failover**
@@ -437,12 +441,12 @@ down why that's worth the cost of reading the orders topic twice.
 **Calculation, per product:**
 
 ```
-sold      = SUM(quantity) of orders that are not cancelled
-received  = SUM(quantity) of restocks with status 'received'
-on_order  = SUM(quantity) of restocks with status 'requested'
+sold = SUM(quantity) of orders that are not cancelled
+received = SUM(quantity) of restocks with status 'received'
+on_order = SUM(quantity) of restocks with status 'requested'
 
-stock     = opening_stock + received − sold
-position  = stock + on_order                     ← inventory position
+stock = opening_stock + received − sold
+position = stock + on_order ← inventory position
 needs_refill = position <= reorder_point
 ```
 
@@ -466,6 +470,12 @@ in CDC.
   `products`. Use `COALESCE(x, 0)` for products with no sales or restocks yet.
 - Moving a restock from `requested` to `received` is an UPDATE. The `-U` row removes it from
   `on_order`, and the `+U` row adds it to `received`. No special code needed: the changelog does it.
+- **Turn on mini-batch** (`table.exec.mini-batch.*`, as in the sales job). Without it, the
+  aggregate handles that `-U` and `+U` one at a time and emits an intermediate row with
+  `on_order = 0` and `received = 0`. Its position is below the reorder point, so it goes out as a
+  real alert, and Phase 10 orders a second refill the moment the first one is delivered.
+- Put the subqueries inside one `CREATE TEMPORARY VIEW`. Views built on other views fail inside
+  `EXECUTE STATEMENT SET` in the SQL client with "belongs to a different planner".
 - A regular join of changelog streams keeps state for both sides. Note in your notes how big
   that state would get with 10 million orders, and look up `table.exec.state.ttl`.
 </details>
@@ -531,7 +541,9 @@ requested → alert tombstone → supplier receives it → stock goes up in `inv
 
 **Goal:** a page with live analytics and inventory.
 
-**Backend** (`dashboard/app.py`, FastAPI, consumer group `dashboard`):
+**Backend** (`dashboard/flink/app.py`, FastAPI, consumer group `dashboard`). In the repo this is
+the `dashboard-flink` service on http://localhost:8001. It stays next to the Phase 20 version, so
+you can compare the two.
 
 - A background thread reads `metrics.sales_by_channel_10s`, `metrics.sales_by_channel_totals`
   and `inventory.levels` into in-memory key→value maps. Tombstones delete a key.
@@ -582,6 +594,11 @@ the point of Kafka in the middle.
 
 **Goal:** an S3-compatible object store with two buckets: `raw` (landing zone) and `lake`
 (Spark's tables).
+
+> **In this repo:** MinIO's images are no longer published, so the `rustfs` service (also
+> S3-compatible, same ports: API on 9000, console on 9001, user and password `rustfsadmin`)
+> stands in for it, and the one-shot `s3-init` service creates both buckets with the AWS CLI.
+> Everything below about S3 works the same way. Read "MinIO" as "the object store".
 
 **Tasks**
 
@@ -649,7 +666,10 @@ you can download one and see Debezium events, one JSON object per line.
 - Look at a file name. It contains the partition and the **starting offset**. Why does that make
   the sink's writes idempotent after a restart? (Look up the connector's exactly-once note: it
   depends on using a *deterministic* partitioner and `rotate.interval.ms`, not
-  `rotate.schedule.interval.ms`.)
+  `rotate.schedule.interval.ms`.) Then the catch: `rotate.interval.ms` closes a file only when a
+  newer record arrives, so once the generators stop, the last file is never written. The repo
+  keeps `rotate.schedule.interval.ms` so the "generators stopped, numbers match" checks in
+  Phase 16 can pass. Write down which guarantee you're giving up.
 - Set `flush.size=1` for a minute. Count the files. That's the **small files problem**. Set it
   back.
 - Check `kafka-consumer-groups.sh --list`. What group name does the sink use? It's just another
@@ -664,7 +684,9 @@ you can download one and see Debezium events, one JSON object per line.
 **Tasks**
 
 1. `spark-master` and `spark-worker` services from `apache/spark:3.5.3`. Master UI on 8082 (8080
-   is taken by Kafka UI), worker with 2 cores and ~2 GB.
+   is taken by Kafka UI), worker with **3 cores and ~3 GB**: bronze, silver and gold each hold
+   one core for as long as they run, so with 2 cores the third job waits forever. Each running
+   application also gets its own UI on 4040, 4041 and 4042 (publish them from `spark-master`).
 2. Mount `./spark` into both containers (e.g. at `/opt/jobs`).
 3. Configure S3A for MinIO: endpoint, credentials, path-style access, no SSL.
 4. Make the `hadoop-aws` and `delta-spark` packages available. The `hadoop-aws` version must
@@ -768,7 +790,16 @@ Do A first, then try B if you want the challenge.
   a newer one.
 - Change Data Feed: `ALTER TABLE ... SET TBLPROPERTIES (delta.enableChangeDataFeed = true)` and
   `readStream.format("delta").option("readChangeFeed", "true")`.
+- A streaming read of a folder that doesn't exist yet fails at startup. If silver starts before
+  bronze has written its first batch, wait for `bronze/orders/_spark_metadata` first.
+- Submitting the same job twice gives two writers on one table. Make your submit script skip a
+  job that's already running.
 </details>
+
+**Optional: a lake dashboard.** Spark isn't a server a web page can query, but its output is
+Delta tables in S3, and the `deltalake` Python package (delta-rs) reads them without Spark. The
+repo's `dashboard/spark` (`dashboard-spark` on http://localhost:8002, profile `lake`) shows
+totals and orders per minute from silver, daily sales from gold, and how far behind the lake is.
 
 **✅ Done when** (with the generators stopped and a couple of minutes for files to flush):
 
@@ -782,8 +813,8 @@ Phase 8. Three systems, one answer.
 
 **🧪 Lab: hot vs. cold**
 
-1. Cancel an order in Postgres. Time how long until (a) the dashboard reflects it and (b) silver
-   reflects it. Explain each delay step by step (connector flush, file listing, trigger interval).
+1. Cancel an order in Postgres. Time how long until (a) the dashboard (`dashboard-flink`, :8001)
+   reflects it and (b) silver reflects it (`dashboard-spark`, :8002). Explain each delay step by step (connector flush, file listing, trigger interval).
 2. Delete everything under `s3://lake/` and both checkpoints, then restart the Spark jobs. The lake
    rebuilds itself completely from `raw`. Could Flink rebuild after 7 days of Kafka retention?
    This is why the cold path exists.
@@ -861,17 +892,21 @@ change event in a raw table.
 **✅ Done when**
 
 ```bash
-docker compose exec clickhouse clickhouse-client \
+docker compose exec clickhouse clickhouse-client --user shop --password shop \
   -q "SELECT op, channel, count() FROM shop.orders_events GROUP BY op, channel ORDER BY op, channel"
 ```
 
-…shows `r`, `c` and `u` rows for both channels and keeps growing, and
+…shows `c` rows for both channels and `u` rows for online (plus `r` rows if Debezium's initial
+snapshot found orders), keeps growing, and
 `kafka-consumer-groups.sh --describe --group clickhouse-orders` shows 2 members, one per
 partition. (Compare with the consumer group lab in Phase 6.)
 
 **🧪 Lab:** look at `system.parts` for `orders_events`. Every few seconds a new **part** appears,
 then background merges combine them. Why does ClickHouse prefer a few large inserts over many
-small ones? What setting in the Kafka engine controls the batch size?
+small ones? What setting in the Kafka engine controls the batch size? (Look at
+`kafka_flush_interval_ms` and `kafka_max_block_size`. The flush interval falls back to
+`stream_flush_interval_ms`, 7.5 s by default, which is most of the delay between Flink's output
+and the Phase 20 dashboard.)
 
 ---
 
@@ -892,8 +927,8 @@ to Spark's silver table. Same idea, very different mechanism.
 versions are still there:
 
 ```sql
-SELECT count() FROM shop.orders_current;          -- may be higher than the number of orders
-SELECT count() FROM shop.orders_current FINAL;    -- deduplicated at query time: correct
+SELECT count() FROM shop.orders_current; -- may be higher than the number of orders
+SELECT count() FROM shop.orders_current FINAL; -- deduplicated at query time: correct
 ```
 
 <details><summary>Hints</summary>
@@ -999,7 +1034,9 @@ CDC   ──▶ pg.public.orders ───────────────�
    tombstone should do here.)
 2. **Switch the dashboard backend** to `clickhouse-connect`. Remove the Kafka consumer thread.
    `/api/sales` and `/api/inventory` now run SQL against ClickHouse. The frontend doesn't change
-   at all: that's the benefit of a clean API.
+   at all: that's the benefit of a clean API. (The repo keeps both: this version is
+   `dashboard/clickhouse`, the `dashboard-clickhouse` service on http://localhost:8000, and the
+   Phase 11 version stays as `dashboard-flink` on :8001.)
 3. **Add ad hoc analytics:** `GET /api/explore`, a **fixed, parameterized** query that takes
    `channel`, `minutes` and `group_by` (product / store / hour). Never paste user input into SQL.
    Show the result in an "Explore" section on the page.
@@ -1094,6 +1131,9 @@ order and one refill travel end to end, and **"What I'd change for production"**
   expire raw events
 - when you'd keep Flink, Spark **and** ClickHouse, and when one or two of them is enough
 
+The repo's `PRODUCTION.md` goes further: managed services for each component on AWS, Google
+Cloud and Azure, the design changes, and a rollout plan.
+
 ---
 
 ## Troubleshooting cheatsheet
@@ -1124,3 +1164,11 @@ order and one refill travel end to end, and **"What I'd change for production"**
 | `orders_current` has too many rows | Expected before merges: query with `FINAL` or `argMax` |
 | `sales_hourly` doesn't drop on cancellation | The view isn't emitting the `before` row with `sign = −1` for `op = 'u'` |
 | Containers get killed | Give Docker Desktop more memory, or start fewer parts with compose profiles |
+| Flink SQL client: "belongs to a different planner" | A temporary view built on other views, used inside `EXECUTE STATEMENT SET`: inline them as subqueries in one view |
+| A second refill is ordered right when the first is delivered | Mini-batch off in the inventory job: the `requested → received` update emits an intermediate row that looks like an alert |
+| An extra refill after resubmitting the inventory job | The job started with empty state and replayed history, re-emitting old alerts. Restart from a savepoint instead |
+| `Unknown module: jdk.compiler` / "dumb terminal" warnings from the SQL client | Harmless: the Java runtime lacks that module, and `exec -T` has no terminal |
+| Last S3 file never appears after the generators stop | `rotate.interval.ms` only rotates on a newer record; `rotate.schedule.interval.ms` rotates on wall-clock time |
+| Spark silver fails with `PATH_NOT_FOUND` for bronze | Silver started before bronze wrote its first batch: wait for `_spark_metadata` |
+| A Spark job stays WAITING, or gold never shows on the master UI | Not enough worker cores: each streaming job holds one, so 3 jobs need 3 cores |
+| `tail: cannot open '#'` | A copied `# comment` after a command: zsh doesn't treat `#` as a comment when you type commands |

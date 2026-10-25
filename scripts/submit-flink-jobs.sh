@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Submit Flink SQL jobs with the SQL client inside the jobmanager container.
-# Usage: ./scripts/submit-flink-jobs.sh [file.sql ...]   (default: every file in flink/sql/)
+# Usage: ./scripts/submit-flink-jobs.sh [file.sql ...] (default: every file in flink/sql/)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

@@ -1,4 +1,4 @@
-"""Dashboard backend: a Kafka consumer thread keeps Flink's upsert topics in memory, FastAPI serves them."""
+"""Dashboard backend (Phase 11): a Kafka consumer thread keeps Flink's upsert topics in memory, FastAPI serves them."""
 
 import json
 import os

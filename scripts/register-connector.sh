@@ -16,7 +16,7 @@ register() {
 }
 
 register shop-connector debezium/shop-connector.json
-register s3-sink        s3-sink/s3-sink-connector.json
+register s3-sink s3-sink/s3-sink-connector.json
 
 sleep 5
 for name in shop-connector s3-sink; do
